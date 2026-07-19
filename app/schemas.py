@@ -6,10 +6,18 @@ class UserLogin(BaseModel):
     username: str
     password: str
 
+class UserRegister(BaseModel):
+    username: str
+    password: str
+    label: str
+
 class UserResponse(BaseModel):
     username: str
     role: str
     label: str
+    is_approved: bool
+
+    model_config = ConfigDict(from_attributes=True)
 
 class PhotoSchema(BaseModel):
     img: str
@@ -84,11 +92,16 @@ class CultureInfoSchema(BaseModel):
     culture: str
     culturePhotos: List[CulturePhotoSchema]
 
+class CountryCreateInput(BaseModel):
+    name: str
+    flag: str
+
 class CountryUpdate(BaseModel):
     motto: str
     desc: str
     videoUrl: str
     accent: str
+    flag: str
     highlights: List[str]
     potentialNeighborhoods: List[PotentialNeighborhoodSchema]
     cultureInfo: CultureInfoSchema
@@ -96,6 +109,7 @@ class CountryUpdate(BaseModel):
 class CountryResponse(BaseModel):
     id: str
     name: str
+    flag: str
     motto: str
     accent: str
     desc: str
@@ -104,6 +118,14 @@ class CountryResponse(BaseModel):
     potentialNeighborhoods: List[PotentialNeighborhoodSchema]  # camelCase
     cultureInfo: CultureInfoSchema  # camelCase
     plots: List[PlotResponse]
+
+    model_config = ConfigDict(from_attributes=True)
+
+class NotificationResponse(BaseModel):
+    id: str
+    message: str
+    read: bool
+    timestamp: datetime
 
     model_config = ConfigDict(from_attributes=True)
 
