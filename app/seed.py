@@ -1,7 +1,7 @@
 import json
 import datetime
-from database import SessionLocal, engine, Base
-import models
+from app.database import SessionLocal, engine, Base
+from app import models
 
 # Drop and recreate all tables
 Base.metadata.drop_all(bind=engine)
