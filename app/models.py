@@ -11,6 +11,7 @@ class User(Base):
     password_hash = Column(String, nullable=False)
     role = Column(String, nullable=False)  # "admin" or "owner"
     is_approved = Column(Boolean, default=False)
+    is_suspended = Column(Boolean, default=False)
 
     plots = relationship("Plot", back_populates="owner")
 
@@ -29,6 +30,7 @@ class Country(Base):
     highlights = Column(Text)  # JSON List of strings
     potential_neighborhoods = Column(Text)  # JSON List of dicts
     culture_info = Column(Text)  # JSON dict
+    is_visible = Column(Boolean, default=True)
 
     plots = relationship("Plot", back_populates="country", cascade="all, delete-orphan")
 
@@ -51,6 +53,7 @@ class Plot(Base):
     owner_username = Column(String, ForeignKey("users.username"), nullable=False)
     country_id = Column(String, ForeignKey("countries.id"), nullable=False)
     photos = Column(Text)  # JSON List of dicts
+    is_visible = Column(Boolean, default=True)
 
     owner = relationship("User", back_populates="plots")
     country = relationship("Country", back_populates="plots")
