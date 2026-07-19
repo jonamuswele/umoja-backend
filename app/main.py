@@ -37,6 +37,7 @@ def serialize_country(c: models.Country) -> dict:
     return {
         "id": c.id,
         "name": c.name,
+        "flag": c.flag or "🌍",
         "motto": c.motto,
         "accent": c.accent,
         "desc": c.desc,
@@ -62,35 +63,86 @@ def serialize_inquiry(inq: models.Inquiry) -> dict:
         "countryName": inq.plot.country.name if inq.plot and inq.plot.country else "Unknown"
     }
 
+AFRICAN_FLAGS = {
+    "algeria": "🇩🇿", "angola": "🇦🇴", "benin": "🇧🇯", "botswana": "🇧🇼", "burkina-faso": "🇧🇫",
+    "burundi": "🇧🇮", "cabo-verde": "🇨🇻", "cameroon": "🇨🇲", "central-african-republic": "🇨🇫",
+    "chad": "🇹🇩", "comoros": "🇰🇲", "congo-brazzaville": "🇨🇬", "congo-kinshasa": "🇨🇩",
+    "drc": "🇨🇩", "drc-(congo)": "🇨🇩", "djibouti": "🇩🇯", "egypt": "🇪🇬", "equatorial-guinea": "🇬🇶",
+    "eritrea": "🇪🇷", "eswatini": "🇸🇿", "ethiopia": "🇪🇹", "gabon": "🇬🇦", "gambia": "🇬🇲",
+    "ghana": "🇬🇭", "guinea": "🇬🇳", "guinea-bissau": "🇬🇼", "ivory-coast": "🇨🇮", "kenya": "🇰🇪",
+    "lesotho": "🇱🇸", "liberia": "🇱🇷", "libya": "🇱🇾", "madagascar": "🇲🇬", "malawi": "🇲🇼",
+    "mali": "🇲🇱", "mauritania": "🇲🇷", "mauritius": "🇲🇺", "morocco": "🇲🇦", "mozambique": "🇲🇿",
+    "namibia": "🇳🇦", "niger": "🇳🇪", "nigeria": "🇳🇬", "rwanda": "🇷🇼", "sao-tome-and-principe": "🇸🇹",
+    "senegal": "🇸🇳", "seychelles": "🇸🇨", "sierra-leone": "🇸🇱", "somalia": "🇸🇴", "south-africa": "🇿🇦",
+    "south-sudan": "🇸🇸", "sudan": "🇸🇩", "tanzania": "🇹🇿", "togo": "🇹🇬", "tunisia": "🇹🇳",
+    "uganda": "🇺🇬", "zambia": "🇿🇲", "zimbabwe": "🇿🇼"
+}
+
 # --- ENDPOINTS ---
 
 # 1. Login & Registration
+@app.post("/api/auth/register", response_model=schemas.UserResponse)
+def register(payload: schemas.UserRegister, db: Session = Depends(get_db)):
+    username = payload.username.strip().lower()
+    label = payload.label.strip()
+    
+    if len(username) < 3:
+        raise HTTPException(status_code=400, detail="Username must be at least 3 characters")
+        
+    existing = db.query(models.User).filter(models.User.username == username).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="Username is already taken")
+        
+    # Create inactive user (is_approved=False)
+    new_user = models.User(
+        username=username,
+        password_hash=payload.password, # In production we hash, but here we match the mock pattern
+        role="owner",
+        is_approved=False
+    )
+    db.add(new_user)
+    
+    # Create admin notification
+    notif_id = f"notif-reg-{username}-{int(datetime.datetime.utcnow().timestamp())}"
+    notif = models.Notification(
+        id=notif_id,
+        message=f"New registration request: '{username}' ({label}) is awaiting approval."
+    )
+    db.add(notif)
+    
+    db.commit()
+    db.refresh(new_user)
+    return {
+        "username": new_user.username,
+        "role": new_user.role,
+        "label": label,
+        "is_approved": new_user.is_approved
+    }
+
 @app.post("/api/auth/login", response_model=schemas.UserResponse)
 def login(payload: schemas.UserLogin, db: Session = Depends(get_db)):
     username = payload.username.strip().lower()
     password = payload.password
     
-    # Check admin
-    if username == "admin" and password == "admin":
-        return {"username": "admin", "role": "admin", "label": "Console Admin"}
-        
-    # Check DB
     user = db.query(models.User).filter(models.User.username == username).first()
-    if user:
-        if user.password_hash == password:
-            return {"username": user.username, "role": user.role, "label": payload.username}
-        else:
-            raise HTTPException(status_code=400, detail="Incorrect password")
-            
-    # Auto register owner if password matches landlord template
-    if password == "umoja" and len(username) >= 3:
-        new_user = models.User(username=username, password_hash="umoja", role="owner")
-        db.add(new_user)
-        db.commit()
-        db.refresh(new_user)
-        return {"username": new_user.username, "role": "owner", "label": payload.username}
+    if not user:
+        raise HTTPException(status_code=400, detail="Incorrect credentials. Please register first.")
         
-    raise HTTPException(status_code=400, detail="Incorrect credentials. Landowners use password 'umoja'.")
+    if user.password_hash != password:
+        raise HTTPException(status_code=400, detail="Incorrect password")
+        
+    if not user.is_approved:
+        raise HTTPException(
+            status_code=403, 
+            detail="Your landowner account is pending administrator approval."
+        )
+        
+    return {
+        "username": user.username,
+        "role": user.role,
+        "label": user.username,
+        "is_approved": user.is_approved
+    }
 
 # 2. Get Countries Directory
 @app.get("/api/countries", response_model=List[schemas.CountryResponse])
@@ -118,10 +170,14 @@ def create_plot(
     country = db.query(models.Country).filter(models.Country.id == country_slug).first()
     
     if not country:
-        # Create a new country dynamically with default settings, ready for Admin customization
+        # Resolve flag emoji from the lookup dictionary
+        flag_emoji = AFRICAN_FLAGS.get(country_slug, "🌍")
+        
+        # Create a new country dynamically with default settings
         country = models.Country(
             id=country_slug,
             name=country_name_raw,
+            flag=flag_emoji,
             motto="A Vibrant New Region",
             accent="#1A3E26", # Default dark green
             desc=f"Welcome to {country_name_raw}. Explore vetted, high-value investment plots across premium zones in this growing region.",
@@ -136,6 +192,14 @@ def create_plot(
             })
         )
         db.add(country)
+        
+        # Dispatch notification to the admin
+        notif_id = f"notif-country-{country_slug}-{int(datetime.datetime.utcnow().timestamp())}"
+        notif = models.Notification(
+            id=notif_id,
+            message=f"Landowner added listings in '{country_name_raw}'. Landing page needs customization."
+        )
+        db.add(notif)
         db.commit()
         db.refresh(country)
         
@@ -319,6 +383,7 @@ def update_country(
     country.desc = payload.desc
     country.video_url = payload.videoUrl
     country.accent = payload.accent
+    country.flag = payload.flag
     country.highlights = json.dumps(payload.highlights)
     country.potential_neighborhoods = json.dumps([n.model_dump() for n in payload.potentialNeighborhoods])
     
@@ -333,3 +398,102 @@ def update_country(
     db.commit()
     db.refresh(country)
     return serialize_country(country)
+
+# 11. Create a New Country (Admin Only)
+@app.post("/api/countries", response_model=schemas.CountryResponse)
+def create_country(
+    payload: schemas.CountryCreateInput,
+    x_user_role: str = Header(..., description="Logged in role"),
+    db: Session = Depends(get_db)
+):
+    if x_user_role != "admin":
+        raise HTTPException(status_code=403, detail="Only the main admin can add new countries")
+        
+    country_id = payload.name.strip().lower().replace(" ", "-")
+    existing = db.query(models.Country).filter(models.Country.id == country_id).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="Country already exists")
+        
+    new_country = models.Country(
+        id=country_id,
+        name=payload.name.strip(),
+        flag=payload.flag.strip() or "🌍",
+        motto="A Vibrant New Region",
+        accent="#1A3E26",
+        desc=f"Welcome to {payload.name.strip()}. Explore vetted, high-value investment plots across premium zones in this growing region.",
+        video_url="https://www.w3schools.com/html/mov_bbb.mp4",
+        highlights=json.dumps(["Secure Ownership", "Vetted Surveyor Beacons", "Gated Access"]),
+        potential_neighborhoods=json.dumps([]),
+        culture_info=json.dumps({
+            "whyLive": f"Live here to participate in {payload.name.strip()}'s rising market and beautiful community landscape.",
+            "bestBuild": "Modern Eco-Villas or architectural designs matching the local topography.",
+            "culture": "Warm hospitality, rich regional traditions, and community values.",
+            "culturePhotos": []
+        })
+    )
+    db.add(new_country)
+    db.commit()
+    db.refresh(new_country)
+    return serialize_country(new_country)
+
+# 12. Get Pending Approvals (Admin Only)
+@app.get("/api/admin/pending-users", response_model=List[schemas.UserResponse])
+def get_pending_users(
+    x_user_role: str = Header(..., description="Logged in role"),
+    db: Session = Depends(get_db)
+):
+    if x_user_role != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+    pending = db.query(models.User).filter(models.User.is_approved == False).all()
+    return [
+        {
+            "username": u.username,
+            "role": u.role,
+            "label": u.username,
+            "is_approved": u.is_approved
+        }
+        for u in pending
+    ]
+
+# 13. Approve User Registration (Admin Only)
+@app.post("/api/admin/approve-user/{username}")
+def approve_user(
+    username: str,
+    x_user_role: str = Header(..., description="Logged in role"),
+    db: Session = Depends(get_db)
+):
+    if x_user_role != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+    user = db.query(models.User).filter(models.User.username == username).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    user.is_approved = True
+    db.commit()
+    return {"status": "success", "message": f"User {username} has been approved."}
+
+# 14. Get System Notifications (Admin Only)
+@app.get("/api/admin/notifications", response_model=List[schemas.NotificationResponse])
+def get_notifications(
+    x_user_role: str = Header(..., description="Logged in role"),
+    db: Session = Depends(get_db)
+):
+    if x_user_role != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+    notifs = db.query(models.Notification).order_by(models.Notification.timestamp.desc()).all()
+    return notifs
+
+# 15. Mark Notification as Read (Admin Only)
+@app.post("/api/admin/notifications/{notif_id}/read")
+def mark_notification_read(
+    notif_id: str,
+    x_user_role: str = Header(..., description="Logged in role"),
+    db: Session = Depends(get_db)
+):
+    if x_user_role != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+    notif = db.query(models.Notification).filter(models.Notification.id == notif_id).first()
+    if not notif:
+        raise HTTPException(status_code=404, detail="Notification not found")
+    notif.read = True
+    db.commit()
+    return {"status": "success"}
