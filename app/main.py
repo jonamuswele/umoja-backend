@@ -5,9 +5,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from typing import List, Optional
 
-from database import engine, get_db
-import models
-import schemas
+from app.database import engine, get_db
+from app import models
+from app import schemas
 
 app = FastAPI(title="Umoja Terra Backend API")
 
