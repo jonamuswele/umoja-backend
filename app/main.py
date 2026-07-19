@@ -11,11 +11,11 @@ from app import schemas
 
 app = FastAPI(title="Umoja Terra Backend API")
 
-# Configure CORS for local development
+# Configure CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
