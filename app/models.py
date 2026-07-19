@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, Text, DateTime, ForeignKey
+from sqlalchemy import Column, Integer, String, Float, Text, DateTime, ForeignKey, Boolean
 from sqlalchemy.orm import relationship
 import datetime
 from app.database import Base
@@ -10,6 +10,7 @@ class User(Base):
     username = Column(String, unique=True, index=True, nullable=False)
     password_hash = Column(String, nullable=False)
     role = Column(String, nullable=False)  # "admin" or "owner"
+    is_approved = Column(Boolean, default=False)
 
     plots = relationship("Plot", back_populates="owner")
 
@@ -18,6 +19,7 @@ class Country(Base):
 
     id = Column(String, primary_key=True, index=True)  # e.g., "kenya"
     name = Column(String, nullable=False)
+    flag = Column(String, default="🌍")
     motto = Column(String)
     accent = Column(String)
     desc = Column(Text)
@@ -29,6 +31,14 @@ class Country(Base):
     culture_info = Column(Text)  # JSON dict
 
     plots = relationship("Plot", back_populates="country", cascade="all, delete-orphan")
+
+class Notification(Base):
+    __tablename__ = "notifications"
+
+    id = Column(String, primary_key=True, index=True)
+    message = Column(String, nullable=False)
+    read = Column(Boolean, default=False)
+    timestamp = Column(DateTime, default=datetime.datetime.utcnow)
 
 class Plot(Base):
     __tablename__ = "plots"
