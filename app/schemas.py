@@ -16,6 +16,7 @@ class UserResponse(BaseModel):
     role: str
     label: str
     is_approved: bool
+    is_suspended: bool
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -49,6 +50,7 @@ class PlotResponse(BaseModel):
     owner_username: str
     country_id: str
     photos: List[PhotoSchema]
+    isVisible: bool
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -118,6 +120,7 @@ class CountryResponse(BaseModel):
     potentialNeighborhoods: List[PotentialNeighborhoodSchema]  # camelCase
     cultureInfo: CultureInfoSchema  # camelCase
     plots: List[PlotResponse]
+    isVisible: bool
 
     model_config = ConfigDict(from_attributes=True)
 
