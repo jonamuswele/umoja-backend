@@ -84,6 +84,15 @@ class CultureInfoSchema(BaseModel):
     culture: str
     culturePhotos: List[CulturePhotoSchema]
 
+class CountryUpdate(BaseModel):
+    motto: str
+    desc: str
+    videoUrl: str
+    accent: str
+    highlights: List[str]
+    potentialNeighborhoods: List[PotentialNeighborhoodSchema]
+    cultureInfo: CultureInfoSchema
+
 class CountryResponse(BaseModel):
     id: str
     name: str
