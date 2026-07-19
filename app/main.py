@@ -9,6 +9,51 @@ from app.database import engine, get_db
 from app import models
 from app import schemas
 
+# Auto-migration script to ensure new columns are added without crashing old databases
+def run_migrations():
+    from app.database import SessionLocal
+    from sqlalchemy import text
+    try:
+        models.Base.metadata.create_all(bind=engine)
+    except Exception as e:
+        print(f"Base.metadata.create_all failed: {e}")
+
+    db = SessionLocal()
+    try:
+        # 1. users.is_suspended column migration
+        try:
+            db.execute(text("SELECT is_suspended FROM users LIMIT 1"))
+        except Exception:
+            db.rollback()
+            print("Auto-Migration: adding users.is_suspended column")
+            db.execute(text("ALTER TABLE users ADD COLUMN is_suspended BOOLEAN DEFAULT FALSE"))
+            db.commit()
+
+        # 2. countries.is_visible column migration
+        try:
+            db.execute(text("SELECT is_visible FROM countries LIMIT 1"))
+        except Exception:
+            db.rollback()
+            print("Auto-Migration: adding countries.is_visible column")
+            db.execute(text("ALTER TABLE countries ADD COLUMN is_visible BOOLEAN DEFAULT TRUE"))
+            db.commit()
+
+        # 3. plots.is_visible column migration
+        try:
+            db.execute(text("SELECT is_visible FROM plots LIMIT 1"))
+        except Exception:
+            db.rollback()
+            print("Auto-Migration: adding plots.is_visible column")
+            db.execute(text("ALTER TABLE plots ADD COLUMN is_visible BOOLEAN DEFAULT TRUE"))
+            db.commit()
+    except Exception as e:
+        print(f"Auto-migration error: {e}")
+        db.rollback()
+    finally:
+        db.close()
+
+run_migrations()
+
 app = FastAPI(title="Umoja Terra Backend API")
 
 # Configure CORS
