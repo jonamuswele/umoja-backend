@@ -247,6 +247,26 @@ def update_plot(
     db.refresh(plot)
     return serialize_plot(plot)
 
+# 4b. Delete Plot Listing (Owner or Admin Only)
+@app.delete("/api/plots/{plot_id}")
+def delete_plot(
+    plot_id: str,
+    x_user_username: str = Header(..., description="Logged in username"),
+    x_user_role: str = Header(..., description="Logged in role"),
+    db: Session = Depends(get_db)
+):
+    plot = db.query(models.Plot).filter(models.Plot.id == plot_id).first()
+    if not plot:
+        raise HTTPException(status_code=404, detail="Plot not found")
+        
+    # Check permissions
+    if x_user_role != "admin" and plot.owner_username != x_user_username:
+        raise HTTPException(status_code=403, detail="You do not own this listing")
+        
+    db.delete(plot)
+    db.commit()
+    return {"status": "success", "message": f"Plot {plot_id} successfully deleted."}
+
 # 5. Track Click/View
 @app.post("/api/plots/{plot_id}/view")
 def track_view(plot_id: str, db: Session = Depends(get_db)):
