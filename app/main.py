@@ -30,7 +30,8 @@ def serialize_plot(p: models.Plot) -> dict:
         "neighborhood": p.neighborhood,
         "owner_username": p.owner_username,
         "country_id": p.country_id,
-        "photos": json.loads(p.photos or "[]")
+        "photos": json.loads(p.photos or "[]"),
+        "isVisible": p.is_visible
     }
 
 def serialize_country(c: models.Country) -> dict:
@@ -45,7 +46,8 @@ def serialize_country(c: models.Country) -> dict:
         "highlights": json.loads(c.highlights or "[]"),
         "potentialNeighborhoods": json.loads(c.potential_neighborhoods or "[]"),
         "cultureInfo": json.loads(c.culture_info or "{}"),
-        "plots": [serialize_plot(p) for p in c.plots]
+        "plots": [serialize_plot(p) for p in c.plots],
+        "isVisible": c.is_visible
     }
 
 def serialize_inquiry(inq: models.Inquiry) -> dict:
@@ -116,7 +118,8 @@ def register(payload: schemas.UserRegister, db: Session = Depends(get_db)):
         "username": new_user.username,
         "role": new_user.role,
         "label": label,
-        "is_approved": new_user.is_approved
+        "is_approved": new_user.is_approved,
+        "is_suspended": new_user.is_suspended
     }
 
 @app.post("/api/auth/login", response_model=schemas.UserResponse)
@@ -131,6 +134,12 @@ def login(payload: schemas.UserLogin, db: Session = Depends(get_db)):
     if user.password_hash != password:
         raise HTTPException(status_code=400, detail="Incorrect password")
         
+    if user.is_suspended:
+        raise HTTPException(
+            status_code=403,
+            detail="Your account has been suspended by the administrator. Please contact support."
+        )
+        
     if not user.is_approved:
         raise HTTPException(
             status_code=403, 
@@ -141,14 +150,38 @@ def login(payload: schemas.UserLogin, db: Session = Depends(get_db)):
         "username": user.username,
         "role": user.role,
         "label": user.username,
-        "is_approved": user.is_approved
+        "is_approved": user.is_approved,
+        "is_suspended": user.is_suspended
     }
 
 # 2. Get Countries Directory
 @app.get("/api/countries", response_model=List[schemas.CountryResponse])
-def get_countries(db: Session = Depends(get_db)):
+def get_countries(
+    x_user_role: Optional[str] = Header(None, description="Logged in role"),
+    x_user_username: Optional[str] = Header(None, description="Logged in username"),
+    db: Session = Depends(get_db)
+):
     countries = db.query(models.Country).all()
-    return [serialize_country(c) for c in countries]
+    if x_user_role == "admin":
+        return [serialize_country(c) for c in countries]
+        
+    res = []
+    for c in countries:
+        # If country is hidden, public users shouldn't see it at all
+        if not c.is_visible:
+            continue
+            
+        # Filter plots in this country
+        filtered_plots = []
+        for p in c.plots:
+            # Plot must be visible, OR request must come from the owner of the plot
+            if p.is_visible or (x_user_username and p.owner_username == x_user_username):
+                filtered_plots.append(serialize_plot(p))
+                
+        c_dict = serialize_country(c)
+        c_dict["plots"] = filtered_plots
+        res.append(c_dict)
+    return res
 
 # 3. Create New Plot Listing (With Dynamic Country Creation)
 @app.post("/api/plots", response_model=schemas.PlotResponse)
@@ -437,7 +470,7 @@ def create_country(
     new_country = models.Country(
         id=country_id,
         name=payload.name.strip(),
-        flag=payload.flag.strip() or "🌍",
+        flag=AFRICAN_FLAGS.get(country_id, payload.flag.strip() or "🌍"),
         motto="A Vibrant New Region",
         accent="#1A3E26",
         desc=f"Welcome to {payload.name.strip()}. Explore vetted, high-value investment plots across premium zones in this growing region.",
@@ -517,3 +550,91 @@ def mark_notification_read(
     notif.read = True
     db.commit()
     return {"status": "success"}
+
+# 16. Get All Users (Admin Only)
+@app.get("/api/admin/users", response_model=List[schemas.UserResponse])
+def get_all_users(
+    x_user_role: str = Header(..., description="Logged in role"),
+    x_user_username: str = Header(..., description="Logged in username"),
+    db: Session = Depends(get_db)
+):
+    if x_user_role != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+    users = db.query(models.User).filter(models.User.username != x_user_username).all()
+    return [
+        {
+            "username": u.username,
+            "role": u.role,
+            "label": u.username,
+            "is_approved": u.is_approved,
+            "is_suspended": u.is_suspended
+        }
+        for u in users
+    ]
+
+# 17. Toggle Suspend User Account (Admin Only)
+@app.post("/api/admin/users/{username}/suspend")
+def toggle_suspend_user(
+    username: str,
+    x_user_role: str = Header(..., description="Logged in role"),
+    db: Session = Depends(get_db)
+):
+    if x_user_role != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+    user = db.query(models.User).filter(models.User.username == username).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    user.is_suspended = not user.is_suspended
+    db.commit()
+    return {"status": "success", "is_suspended": user.is_suspended, "message": f"User {username} suspension status toggled."}
+
+# 18. Delete User Account (Admin Only)
+@app.delete("/api/admin/users/{username}")
+def delete_user(
+    username: str,
+    x_user_role: str = Header(..., description="Logged in role"),
+    db: Session = Depends(get_db)
+):
+    if x_user_role != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+    user = db.query(models.User).filter(models.User.username == username).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    # Also delete their plots to cascade properly since database constraints require it
+    db.query(models.Plot).filter(models.Plot.owner_username == username).delete()
+    db.delete(user)
+    db.commit()
+    return {"status": "success", "message": f"User {username} and their listings have been deleted."}
+
+# 19. Toggle Country Visibility (Admin Only)
+@app.post("/api/admin/countries/{country_id}/visibility")
+def toggle_country_visibility(
+    country_id: str,
+    x_user_role: str = Header(..., description="Logged in role"),
+    db: Session = Depends(get_db)
+):
+    if x_user_role != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+    country = db.query(models.Country).filter(models.Country.id == country_id).first()
+    if not country:
+        raise HTTPException(status_code=404, detail="Country not found")
+    country.is_visible = not country.is_visible
+    db.commit()
+    return {"status": "success", "isVisible": country.is_visible}
+
+# 20. Toggle Plot Visibility (Admin Only)
+@app.post("/api/admin/plots/{plot_id}/visibility")
+def toggle_plot_visibility(
+    plot_id: str,
+    x_user_role: str = Header(..., description="Logged in role"),
+    db: Session = Depends(get_db)
+):
+    if x_user_role != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+    plot = db.query(models.Plot).filter(models.Plot.id == plot_id).first()
+    if not plot:
+        raise HTTPException(status_code=404, detail="Plot not found")
+    plot.is_visible = not plot.is_visible
+    db.commit()
+    return {"status": "success", "isVisible": plot.is_visible}
