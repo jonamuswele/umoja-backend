@@ -98,7 +98,7 @@ def get_countries(db: Session = Depends(get_db)):
     countries = db.query(models.Country).all()
     return [serialize_country(c) for c in countries]
 
-# 3. Create New Plot Listing
+# 3. Create New Plot Listing (With Dynamic Country Creation)
 @app.post("/api/plots", response_model=schemas.PlotResponse)
 def create_plot(
     payload: schemas.PlotCreate,
@@ -109,9 +109,35 @@ def create_plot(
     if x_user_role not in ["admin", "owner"]:
         raise HTTPException(status_code=403, detail="Insufficient permissions")
         
-    country = db.query(models.Country).filter(models.Country.id == payload.country_id).first()
+    country_name_raw = payload.country_id.strip()
+    if not country_name_raw:
+        raise HTTPException(status_code=400, detail="Country name cannot be empty")
+        
+    # Generate clean, slugified key. E.g. "Sierra Leone" -> "sierra-leone"
+    country_slug = country_name_raw.lower().replace(" ", "-")
+    country = db.query(models.Country).filter(models.Country.id == country_slug).first()
+    
     if not country:
-        raise HTTPException(status_code=404, detail="Country not found")
+        # Create a new country dynamically with default settings, ready for Admin customization
+        country = models.Country(
+            id=country_slug,
+            name=country_name_raw,
+            motto="A Vibrant New Region",
+            accent="#1A3E26", # Default dark green
+            desc=f"Welcome to {country_name_raw}. Explore vetted, high-value investment plots across premium zones in this growing region.",
+            video_url="https://www.w3schools.com/html/mov_bbb.mp4",
+            highlights=json.dumps(["Secure Ownership", "Vetted Surveyor Beacons", "Gated Access"]),
+            potential_neighborhoods=json.dumps([]),
+            culture_info=json.dumps({
+                "whyLive": f"Live here to participate in {country_name_raw}'s rising market and beautiful community landscape.",
+                "bestBuild": "Modern Eco-Villas or architectural designs matching the local topography.",
+                "culture": "Warm hospitality, rich regional traditions, and community values.",
+                "culturePhotos": []
+            })
+        )
+        db.add(country)
+        db.commit()
+        db.refresh(country)
         
     plot_id = f"plot-{int(datetime.datetime.utcnow().timestamp())}"
     new_plot = models.Plot(
@@ -121,7 +147,7 @@ def create_plot(
         price=payload.price,
         neighborhood=payload.neighborhood,
         owner_username=x_user_username,
-        country_id=payload.country_id,
+        country_id=country.id,
         photos=json.dumps([p.model_dump() for p in payload.photos])
     )
     
@@ -273,3 +299,37 @@ def get_dashboard_stats(
         "leads": leads_list,
         "viewsChart": views_chart
     }
+
+# 10. Update Country Metadata (Admin Only)
+@app.put("/api/countries/{country_id}", response_model=schemas.CountryResponse)
+def update_country(
+    country_id: str,
+    payload: schemas.CountryUpdate,
+    x_user_role: str = Header(..., description="Logged in role"),
+    db: Session = Depends(get_db)
+):
+    if x_user_role != "admin":
+        raise HTTPException(status_code=403, detail="Only the main admin can customize country landing pages")
+        
+    country = db.query(models.Country).filter(models.Country.id == country_id).first()
+    if not country:
+        raise HTTPException(status_code=404, detail="Country not found")
+        
+    country.motto = payload.motto
+    country.desc = payload.desc
+    country.video_url = payload.videoUrl
+    country.accent = payload.accent
+    country.highlights = json.dumps(payload.highlights)
+    country.potential_neighborhoods = json.dumps([n.model_dump() for n in payload.potentialNeighborhoods])
+    
+    # Store cultureInfo properly
+    country.culture_info = json.dumps({
+        "whyLive": payload.cultureInfo.whyLive,
+        "bestBuild": payload.cultureInfo.bestBuild,
+        "culture": payload.cultureInfo.culture,
+        "culturePhotos": [p.model_dump() for p in payload.cultureInfo.culturePhotos]
+    })
+    
+    db.commit()
+    db.refresh(country)
+    return serialize_country(country)
