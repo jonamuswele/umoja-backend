@@ -1,62 +1,14 @@
 import json
 import datetime
-from fastapi import FastAPI, Depends, HTTPException, Header, status
+from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy.orm import Session
 from typing import List, Optional
 
-from app.database import engine, get_db
-from app import models
-from app import schemas
-
-# Auto-migration script to ensure new columns are added without crashing old databases
-def run_migrations():
-    from app.database import SessionLocal
-    from sqlalchemy import text
-    try:
-        models.Base.metadata.create_all(bind=engine)
-    except Exception as e:
-        print(f"Base.metadata.create_all failed: {e}")
-
-    db = SessionLocal()
-    try:
-        # 1. users.is_suspended column migration
-        try:
-            db.execute(text("SELECT is_suspended FROM users LIMIT 1"))
-        except Exception:
-            db.rollback()
-            print("Auto-Migration: adding users.is_suspended column")
-            db.execute(text("ALTER TABLE users ADD COLUMN is_suspended BOOLEAN DEFAULT FALSE"))
-            db.commit()
-
-        # 2. countries.is_visible column migration
-        try:
-            db.execute(text("SELECT is_visible FROM countries LIMIT 1"))
-        except Exception:
-            db.rollback()
-            print("Auto-Migration: adding countries.is_visible column")
-            db.execute(text("ALTER TABLE countries ADD COLUMN is_visible BOOLEAN DEFAULT TRUE"))
-            db.commit()
-
-        # 3. plots.is_visible column migration
-        try:
-            db.execute(text("SELECT is_visible FROM plots LIMIT 1"))
-        except Exception:
-            db.rollback()
-            print("Auto-Migration: adding plots.is_visible column")
-            db.execute(text("ALTER TABLE plots ADD COLUMN is_visible BOOLEAN DEFAULT TRUE"))
-            db.commit()
-    except Exception as e:
-        print(f"Auto-migration error: {e}")
-        db.rollback()
-    finally:
-        db.close()
-
-run_migrations()
+from database import init_db
+from models import User, Country, Plot, Inquiry, Notification
 
 app = FastAPI(title="Umoja Terra Backend API")
 
-# Configure CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -64,51 +16,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# Helper serializers
-def serialize_plot(p: models.Plot) -> dict:
-    return {
-        "id": p.id,
-        "title": p.title,
-        "size": p.size,
-        "price": p.price,
-        "neighborhood": p.neighborhood,
-        "owner_username": p.owner_username,
-        "country_id": p.country_id,
-        "photos": json.loads(p.photos or "[]"),
-        "isVisible": p.is_visible
-    }
-
-def serialize_country(c: models.Country) -> dict:
-    return {
-        "id": c.id,
-        "name": c.name,
-        "flag": c.flag or "🌍",
-        "motto": c.motto,
-        "accent": c.accent,
-        "desc": c.desc,
-        "videoUrl": c.video_url,
-        "highlights": json.loads(c.highlights or "[]"),
-        "potentialNeighborhoods": json.loads(c.potential_neighborhoods or "[]"),
-        "cultureInfo": json.loads(c.culture_info or "{}"),
-        "plots": [serialize_plot(p) for p in c.plots],
-        "isVisible": c.is_visible
-    }
-
-def serialize_inquiry(inq: models.Inquiry) -> dict:
-    return {
-        "id": inq.id,
-        "plot_id": inq.plot_id,
-        "plotTitle": inq.plot.title if inq.plot else "Unknown Plot",
-        "fullName": inq.full_name,
-        "email": inq.email,
-        "phone": inq.phone,
-        "currentCity": inq.current_city,
-        "message": inq.message,
-        "type": inq.type,
-        "timestamp": inq.timestamp.isoformat() + "Z",
-        "countryName": inq.plot.country.name if inq.plot and inq.plot.country else "Unknown"
-    }
 
 AFRICAN_FLAGS = {
     "algeria": "🇩🇿", "angola": "🇦🇴", "benin": "🇧🇯", "botswana": "🇧🇼", "burkina-faso": "🇧🇫",
@@ -125,561 +32,663 @@ AFRICAN_FLAGS = {
     "uganda": "🇺🇬", "zambia": "🇿🇲", "zimbabwe": "🇿🇼"
 }
 
-# --- ENDPOINTS ---
 
-# 1. Login & Registration
-@app.post("/api/auth/register", response_model=schemas.UserResponse)
-def register(payload: schemas.UserRegister, db: Session = Depends(get_db)):
-    username = payload.username.strip().lower()
-    label = payload.label.strip()
-    
+# ─── D1 helpers ──────────────────────────────────────────────────────────────
+
+def get_db(request: Request):
+    """Extract the D1 binding from the request scope (injected by Cloudflare Workers)."""
+    env = request.scope.get("env")
+    if env is None:
+        raise HTTPException(status_code=500, detail="D1 env binding not available")
+    return env.DB
+
+
+async def d1_first(db, sql: str, *params) -> Optional[dict]:
+    """Run a query and return the first row as a dict, or None."""
+    stmt = db.prepare(sql)
+    if params:
+        stmt = stmt.bind(*params)
+    result = await stmt.first()
+    return result
+
+
+async def d1_all(db, sql: str, *params) -> List[dict]:
+    """Run a query and return all rows as a list of dicts."""
+    stmt = db.prepare(sql)
+    if params:
+        stmt = stmt.bind(*params)
+    result = await stmt.all()
+    return result.results if result.results else []
+
+
+async def d1_run(db, sql: str, *params):
+    """Run an INSERT / UPDATE / DELETE statement."""
+    stmt = db.prepare(sql)
+    if params:
+        stmt = stmt.bind(*params)
+    await stmt.run()
+
+
+# ─── Serializers ─────────────────────────────────────────────────────────────
+
+def serialize_plot(row: dict) -> dict:
+    return {
+        "id": row["id"],
+        "title": row["title"],
+        "size": row.get("size"),
+        "price": row["price"],
+        "neighborhood": row.get("neighborhood"),
+        "owner_username": row["owner_username"],
+        "country_id": row["country_id"],
+        "photos": json.loads(row.get("photos") or "[]"),
+        "isVisible": bool(row.get("is_visible", 1)),
+    }
+
+
+def serialize_country(row: dict, plots: List[dict]) -> dict:
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "flag": row.get("flag") or "🌍",
+        "motto": row.get("motto"),
+        "accent": row.get("accent"),
+        "desc": row.get("desc"),
+        "videoUrl": row.get("video_url"),
+        "highlights": json.loads(row.get("highlights") or "[]"),
+        "potentialNeighborhoods": json.loads(row.get("potential_neighborhoods") or "[]"),
+        "cultureInfo": json.loads(row.get("culture_info") or "{}"),
+        "plots": plots,
+        "isVisible": bool(row.get("is_visible", 1)),
+    }
+
+
+def serialize_inquiry(row: dict) -> dict:
+    return {
+        "id": row["id"],
+        "plot_id": row["plot_id"],
+        "plotTitle": row.get("plot_title") or "Unknown Plot",
+        "fullName": row["full_name"],
+        "email": row["email"],
+        "phone": row.get("phone"),
+        "currentCity": row.get("current_city"),
+        "message": row.get("message"),
+        "type": row["type"],
+        "timestamp": row["timestamp"] + "Z",
+        "countryName": row.get("country_name") or "Unknown",
+    }
+
+
+def now_iso() -> str:
+    return datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def now_ts() -> int:
+    return int(datetime.datetime.utcnow().timestamp())
+
+
+# ─── Startup ─────────────────────────────────────────────────────────────────
+
+@app.on_event("startup")
+async def startup():
+    # Tables are initialised via the D1 migration / wrangler d1 execute command.
+    # init_db() can also be called manually from entry.py if needed.
+    pass
+
+
+# ─── Auth ─────────────────────────────────────────────────────────────────────
+
+@app.post("/api/auth/register")
+async def register(request: Request):
+    db = get_db(request)
+    body = await request.json()
+    username = body.get("username", "").strip().lower()
+    password = body.get("password", "")
+    label = body.get("label", "").strip()
+
     if len(username) < 3:
         raise HTTPException(status_code=400, detail="Username must be at least 3 characters")
-        
-    existing = db.query(models.User).filter(models.User.username == username).first()
+
+    existing = await d1_first(db, "SELECT id FROM users WHERE username = ?", username)
     if existing:
         raise HTTPException(status_code=400, detail="Username is already taken")
-        
-    # Create inactive user (is_approved=False)
-    new_user = models.User(
-        username=username,
-        password_hash=payload.password, # In production we hash, but here we match the mock pattern
-        role="owner",
-        is_approved=False
-    )
-    db.add(new_user)
-    
-    # Create admin notification
-    notif_id = f"notif-reg-{username}-{int(datetime.datetime.utcnow().timestamp())}"
-    notif = models.Notification(
-        id=notif_id,
-        message=f"New registration request: '{username}' ({label}) is awaiting approval."
-    )
-    db.add(notif)
-    
-    db.commit()
-    db.refresh(new_user)
-    return {
-        "username": new_user.username,
-        "role": new_user.role,
-        "label": label,
-        "is_approved": new_user.is_approved,
-        "is_suspended": new_user.is_suspended
-    }
 
-@app.post("/api/auth/login", response_model=schemas.UserResponse)
-def login(payload: schemas.UserLogin, db: Session = Depends(get_db)):
-    username = payload.username.strip().lower()
-    password = payload.password
-    
-    user = db.query(models.User).filter(models.User.username == username).first()
-    if not user:
+    await d1_run(
+        db,
+        "INSERT INTO users (username, password_hash, role, is_approved, is_suspended) VALUES (?, ?, 'owner', 0, 0)",
+        username, password,
+    )
+
+    notif_id = f"notif-reg-{username}-{now_ts()}"
+    await d1_run(
+        db,
+        "INSERT INTO notifications (id, message, read, timestamp) VALUES (?, ?, 0, ?)",
+        notif_id,
+        f"New registration request: '{username}' ({label}) is awaiting approval.",
+        now_iso(),
+    )
+
+    return {"username": username, "role": "owner", "label": label, "is_approved": False, "is_suspended": False}
+
+
+@app.post("/api/auth/login")
+async def login(request: Request):
+    db = get_db(request)
+    body = await request.json()
+    username = body.get("username", "").strip().lower()
+    password = body.get("password", "")
+
+    row = await d1_first(db, "SELECT * FROM users WHERE username = ?", username)
+    if not row:
         raise HTTPException(status_code=400, detail="Incorrect credentials. Please register first.")
-        
-    if user.password_hash != password:
+    if row["password_hash"] != password:
         raise HTTPException(status_code=400, detail="Incorrect password")
-        
-    if user.is_suspended:
-        raise HTTPException(
-            status_code=403,
-            detail="Your account has been suspended by the administrator. Please contact support."
-        )
-        
-    if not user.is_approved:
-        raise HTTPException(
-            status_code=403, 
-            detail="Your landowner account is pending administrator approval."
-        )
-        
+    if row["is_suspended"]:
+        raise HTTPException(status_code=403, detail="Your account has been suspended by the administrator.")
+    if not row["is_approved"]:
+        raise HTTPException(status_code=403, detail="Your landowner account is pending administrator approval.")
+
     return {
-        "username": user.username,
-        "role": user.role,
-        "label": user.username,
-        "is_approved": user.is_approved,
-        "is_suspended": user.is_suspended
+        "username": row["username"],
+        "role": row["role"],
+        "label": row["username"],
+        "is_approved": bool(row["is_approved"]),
+        "is_suspended": bool(row["is_suspended"]),
     }
 
-# 2. Get Countries Directory
-@app.get("/api/countries", response_model=List[schemas.CountryResponse])
-def get_countries(
-    x_user_role: Optional[str] = Header(None, description="Logged in role"),
-    x_user_username: Optional[str] = Header(None, description="Logged in username"),
-    db: Session = Depends(get_db)
+
+# ─── Countries ───────────────────────────────────────────────────────────────
+
+@app.get("/api/countries")
+async def get_countries(
+    request: Request,
+    x_user_role: Optional[str] = Header(None),
+    x_user_username: Optional[str] = Header(None),
 ):
-    countries = db.query(models.Country).all()
-    if x_user_role == "admin":
-        return [serialize_country(c) for c in countries]
-        
-    res = []
+    db = get_db(request)
+    countries = await d1_all(db, "SELECT * FROM countries")
+    result = []
+
     for c in countries:
-        # If country is hidden, public users shouldn't see it at all
-        if not c.is_visible:
+        if x_user_role != "admin" and not c.get("is_visible"):
             continue
-            
-        # Filter plots in this country
+
+        plots = await d1_all(db, "SELECT * FROM plots WHERE country_id = ?", c["id"])
         filtered_plots = []
-        for p in c.plots:
-            # Plot must be visible, OR request must come from the owner of the plot
-            if p.is_visible or (x_user_username and p.owner_username == x_user_username):
+        for p in plots:
+            if x_user_role == "admin" or p.get("is_visible") or (x_user_username and p["owner_username"] == x_user_username):
                 filtered_plots.append(serialize_plot(p))
-                
-        c_dict = serialize_country(c)
-        c_dict["plots"] = filtered_plots
-        res.append(c_dict)
-    return res
 
-# 3. Create New Plot Listing (With Dynamic Country Creation)
-@app.post("/api/plots", response_model=schemas.PlotResponse)
-def create_plot(
-    payload: schemas.PlotCreate,
-    x_user_username: str = Header(..., description="Logged in username"),
-    x_user_role: str = Header(..., description="Logged in role"),
-    db: Session = Depends(get_db)
-):
-    if x_user_role not in ["admin", "owner"]:
-        raise HTTPException(status_code=403, detail="Insufficient permissions")
-        
-    country_name_raw = payload.country_id.strip()
-    if not country_name_raw:
-        raise HTTPException(status_code=400, detail="Country name cannot be empty")
-        
-    # Generate clean, slugified key. E.g. "Sierra Leone" -> "sierra-leone"
-    country_slug = country_name_raw.lower().replace(" ", "-")
-    country = db.query(models.Country).filter(models.Country.id == country_slug).first()
-    
-    if not country:
-        # Resolve flag emoji from the lookup dictionary
-        flag_emoji = AFRICAN_FLAGS.get(country_slug, "🌍")
-        
-        # Create a new country dynamically with default settings
-        country = models.Country(
-            id=country_slug,
-            name=country_name_raw,
-            flag=flag_emoji,
-            motto="A Vibrant New Region",
-            accent="#1A3E26", # Default dark green
-            desc=f"Welcome to {country_name_raw}. Explore vetted, high-value investment plots across premium zones in this growing region.",
-            video_url="https://www.w3schools.com/html/mov_bbb.mp4",
-            highlights=json.dumps(["Secure Ownership", "Vetted Surveyor Beacons", "Gated Access"]),
-            potential_neighborhoods=json.dumps([]),
-            culture_info=json.dumps({
-                "whyLive": f"Live here to participate in {country_name_raw}'s rising market and beautiful community landscape.",
-                "bestBuild": "Modern Eco-Villas or architectural designs matching the local topography.",
-                "culture": "Warm hospitality, rich regional traditions, and community values.",
-                "culturePhotos": []
-            })
-        )
-        db.add(country)
-        
-        # Dispatch notification to the admin
-        notif_id = f"notif-country-{country_slug}-{int(datetime.datetime.utcnow().timestamp())}"
-        notif = models.Notification(
-            id=notif_id,
-            message=f"Landowner added listings in '{country_name_raw}'. Landing page needs customization."
-        )
-        db.add(notif)
-        db.commit()
-        db.refresh(country)
-        
-    plot_id = f"plot-{int(datetime.datetime.utcnow().timestamp())}"
-    new_plot = models.Plot(
-        id=plot_id,
-        title=payload.title,
-        size=payload.size,
-        price=payload.price,
-        neighborhood=payload.neighborhood,
-        owner_username=x_user_username,
-        country_id=country.id,
-        photos=json.dumps([p.model_dump() for p in payload.photos])
-    )
-    
-    db.add(new_plot)
-    db.commit()
-    db.refresh(new_plot)
-    return serialize_plot(new_plot)
+        result.append(serialize_country(c, filtered_plots))
 
-# 4. Edit Plot Specification
-@app.put("/api/plots/{plot_id}", response_model=schemas.PlotResponse)
-def update_plot(
-    plot_id: str,
-    payload: schemas.PlotUpdate,
-    x_user_username: str = Header(..., description="Logged in username"),
-    x_user_role: str = Header(..., description="Logged in role"),
-    db: Session = Depends(get_db)
-):
-    plot = db.query(models.Plot).filter(models.Plot.id == plot_id).first()
-    if not plot:
-        raise HTTPException(status_code=404, detail="Plot not found")
-        
-    # Check permissions (only owner or admin can edit)
-    if x_user_role != "admin" and plot.owner_username != x_user_username:
-        raise HTTPException(status_code=403, detail="You do not own this listing")
-        
-    plot.title = payload.title
-    plot.size = payload.size
-    plot.price = payload.price
-    plot.neighborhood = payload.neighborhood
-    plot.photos = json.dumps([p.model_dump() for p in payload.photos])
-    
-    db.commit()
-    db.refresh(plot)
-    return serialize_plot(plot)
+    return result
 
-# 4b. Delete Plot Listing (Owner or Admin Only)
-@app.delete("/api/plots/{plot_id}")
-def delete_plot(
-    plot_id: str,
-    x_user_username: str = Header(..., description="Logged in username"),
-    x_user_role: str = Header(..., description="Logged in role"),
-    db: Session = Depends(get_db)
-):
-    plot = db.query(models.Plot).filter(models.Plot.id == plot_id).first()
-    if not plot:
-        raise HTTPException(status_code=404, detail="Plot not found")
-        
-    # Check permissions
-    if x_user_role != "admin" and plot.owner_username != x_user_username:
-        raise HTTPException(status_code=403, detail="You do not own this listing")
-        
-    db.delete(plot)
-    db.commit()
-    return {"status": "success", "message": f"Plot {plot_id} successfully deleted."}
 
-# 5. Track Click/View
-@app.post("/api/plots/{plot_id}/view")
-def track_view(plot_id: str, db: Session = Depends(get_db)):
-    plot = db.query(models.Plot).filter(models.Plot.id == plot_id).first()
-    if not plot:
-        raise HTTPException(status_code=404, detail="Plot not found")
-        
-    db.add(models.PlotView(plot_id=plot_id))
-    db.commit()
-    return {"status": "success"}
-
-# 6. Dispatch Inquiry
-@app.post("/api/inquiries", response_model=schemas.InquiryResponse)
-def create_inquiry(payload: schemas.InquiryCreate, db: Session = Depends(get_db)):
-    plot = db.query(models.Plot).filter(models.Plot.id == payload.plot_id).first()
-    if not plot:
-        raise HTTPException(status_code=404, detail="Plot not found")
-        
-    inq_id = f"inq-{int(datetime.datetime.utcnow().timestamp())}"
-    new_inq = models.Inquiry(
-        id=inq_id,
-        plot_id=payload.plot_id,
-        full_name=payload.fullName,
-        email=payload.email,
-        phone=payload.phone,
-        current_city=payload.currentCity,
-        message=payload.message,
-        type=payload.type,
-        timestamp=datetime.datetime.utcnow()
-    )
-    
-    db.add(new_inq)
-    db.commit()
-    db.refresh(new_inq)
-    return serialize_inquiry(new_inq)
-
-# 7. Get Tenant Inquiries/Leads List
-@app.get("/api/inquiries", response_model=List[schemas.InquiryResponse])
-def get_inquiries(
-    x_user_username: str = Header(..., description="Logged in username"),
-    x_user_role: str = Header(..., description="Logged in role"),
-    db: Session = Depends(get_db)
-):
-    query = db.query(models.Inquiry).join(models.Plot)
-    if x_user_role != "admin":
-        query = query.filter(models.Plot.owner_username == x_user_username)
-        
-    inquiries = query.order_by(models.Inquiry.timestamp.desc()).all()
-    return [serialize_inquiry(inq) for inq in inquiries]
-
-# 8. Get Tenant Dashboard Stats
-@app.get("/api/stats/dashboard", response_model=schemas.DashboardStatsResponse)
-def get_dashboard_stats(
-    x_user_username: str = Header(..., description="Logged in username"),
-    x_user_role: str = Header(..., description="Logged in role"),
-    db: Session = Depends(get_db)
-):
-    # Get all plots owned by user (or all plots if admin)
-    plots_query = db.query(models.Plot)
-    if x_user_role != "admin":
-        plots_query = plots_query.filter(models.Plot.owner_username == x_user_username)
-    owned_plots = plots_query.all()
-    owned_plot_ids = [p.id for p in owned_plots]
-    
-    # 1. Total Views
-    views_count = db.query(models.PlotView).filter(models.PlotView.plot_id.in_(owned_plot_ids)).count() if owned_plot_ids else 0
-    
-    # 2. Total Inquiries
-    inquiries_query = db.query(models.Inquiry).filter(models.Inquiry.plot_id.in_(owned_plot_ids)) if owned_plot_ids else None
-    inquiries_count = inquiries_query.count() if inquiries_query else 0
-    
-    # 3. Conversion Rate
-    rate = f"{((inquiries_count / views_count) * 100):.1f}" if views_count > 0 else "0.0"
-    
-    # 4. Leads List
-    inquiries = inquiries_query.join(models.Plot).order_by(models.Inquiry.timestamp.desc()).all() if inquiries_query else []
-    leads_list = [serialize_inquiry(inq) for inq in inquiries]
-    
-    # 5. Last 7 Days Clicks Chart
-    today = datetime.date.today()
-    days_list = []
-    views_chart = []
-    
-    # Generate last 7 days list (date objects and names)
-    for i in range(6, -1, -1):
-        day_date = today - datetime.timedelta(days=i)
-        days_list.append(day_date)
-        
-    # Get views grouped by date
-    for d in days_list:
-        day_start = datetime.datetime.combine(d, datetime.time.min)
-        day_end = datetime.datetime.combine(d, datetime.time.max)
-        
-        # Query count for this day
-        if owned_plot_ids:
-            cnt = db.query(models.PlotView).filter(
-                models.PlotView.plot_id.in_(owned_plot_ids),
-                models.PlotView.timestamp >= day_start,
-                models.PlotView.timestamp <= day_end
-            ).count()
-        else:
-            cnt = 0
-            
-        views_chart.append({
-            "day": d.strftime("%a"),  # e.g., "Mon"
-            "count": cnt,
-            "active": d == today
-        })
-        
-    return {
-        "totalViews": views_count,
-        "totalInquiries": inquiries_count,
-        "conversionRate": rate,
-        "leads": leads_list,
-        "viewsChart": views_chart
-    }
-
-# 10. Update Country Metadata (Admin Only)
-@app.put("/api/countries/{country_id}", response_model=schemas.CountryResponse)
-def update_country(
-    country_id: str,
-    payload: schemas.CountryUpdate,
-    x_user_role: str = Header(..., description="Logged in role"),
-    db: Session = Depends(get_db)
-):
-    if x_user_role != "admin":
-        raise HTTPException(status_code=403, detail="Only the main admin can customize country landing pages")
-        
-    country = db.query(models.Country).filter(models.Country.id == country_id).first()
-    if not country:
-        raise HTTPException(status_code=404, detail="Country not found")
-        
-    country.motto = payload.motto
-    country.desc = payload.desc
-    country.video_url = payload.videoUrl
-    country.accent = payload.accent
-    country.flag = payload.flag
-    country.highlights = json.dumps(payload.highlights)
-    country.potential_neighborhoods = json.dumps([n.model_dump() for n in payload.potentialNeighborhoods])
-    
-    # Store cultureInfo properly
-    country.culture_info = json.dumps({
-        "whyLive": payload.cultureInfo.whyLive,
-        "bestBuild": payload.cultureInfo.bestBuild,
-        "culture": payload.cultureInfo.culture,
-        "culturePhotos": [p.model_dump() for p in payload.cultureInfo.culturePhotos]
-    })
-    
-    db.commit()
-    db.refresh(country)
-    return serialize_country(country)
-
-# 11. Create a New Country (Admin Only)
-@app.post("/api/countries", response_model=schemas.CountryResponse)
-def create_country(
-    payload: schemas.CountryCreateInput,
-    x_user_role: str = Header(..., description="Logged in role"),
-    db: Session = Depends(get_db)
+@app.post("/api/countries")
+async def create_country(
+    request: Request,
+    x_user_role: str = Header(...),
 ):
     if x_user_role != "admin":
         raise HTTPException(status_code=403, detail="Only the main admin can add new countries")
-        
-    country_id = payload.name.strip().lower().replace(" ", "-")
-    existing = db.query(models.Country).filter(models.Country.id == country_id).first()
+
+    db = get_db(request)
+    body = await request.json()
+    name = body.get("name", "").strip()
+    flag_input = body.get("flag", "").strip()
+
+    country_id = name.lower().replace(" ", "-")
+    existing = await d1_first(db, "SELECT id FROM countries WHERE id = ?", country_id)
     if existing:
         raise HTTPException(status_code=400, detail="Country already exists")
-        
-    new_country = models.Country(
-        id=country_id,
-        name=payload.name.strip(),
-        flag=AFRICAN_FLAGS.get(country_id, payload.flag.strip() or "🌍"),
-        motto="A Vibrant New Region",
-        accent="#1A3E26",
-        desc=f"Welcome to {payload.name.strip()}. Explore vetted, high-value investment plots across premium zones in this growing region.",
-        video_url="https://www.w3schools.com/html/mov_bbb.mp4",
-        highlights=json.dumps(["Secure Ownership", "Vetted Surveyor Beacons", "Gated Access"]),
-        potential_neighborhoods=json.dumps([]),
-        culture_info=json.dumps({
-            "whyLive": f"Live here to participate in {payload.name.strip()}'s rising market and beautiful community landscape.",
+
+    flag = AFRICAN_FLAGS.get(country_id, flag_input or "🌍")
+    culture = json.dumps({
+        "whyLive": f"Live here to participate in {name}'s rising market.",
+        "bestBuild": "Modern Eco-Villas or architectural designs matching the local topography.",
+        "culture": "Warm hospitality, rich regional traditions, and community values.",
+        "culturePhotos": [],
+    })
+
+    await d1_run(
+        db,
+        """INSERT INTO countries (id, name, flag, motto, accent, desc, video_url, highlights, potential_neighborhoods, culture_info, is_visible)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)""",
+        country_id, name, flag,
+        "A Vibrant New Region", "#1A3E26",
+        f"Welcome to {name}. Explore vetted, high-value investment plots across premium zones in this growing region.",
+        "https://www.w3schools.com/html/mov_bbb.mp4",
+        json.dumps(["Secure Ownership", "Vetted Surveyor Beacons", "Gated Access"]),
+        json.dumps([]),
+        culture,
+    )
+
+    row = await d1_first(db, "SELECT * FROM countries WHERE id = ?", country_id)
+    return serialize_country(row, [])
+
+
+@app.put("/api/countries/{country_id}")
+async def update_country(
+    country_id: str,
+    request: Request,
+    x_user_role: str = Header(...),
+):
+    if x_user_role != "admin":
+        raise HTTPException(status_code=403, detail="Only the main admin can customize country landing pages")
+
+    db = get_db(request)
+    row = await d1_first(db, "SELECT id FROM countries WHERE id = ?", country_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Country not found")
+
+    body = await request.json()
+    culture_info = body.get("cultureInfo", {})
+    culture_json = json.dumps({
+        "whyLive": culture_info.get("whyLive", ""),
+        "bestBuild": culture_info.get("bestBuild", ""),
+        "culture": culture_info.get("culture", ""),
+        "culturePhotos": culture_info.get("culturePhotos", []),
+    })
+
+    await d1_run(
+        db,
+        """UPDATE countries SET motto=?, desc=?, video_url=?, accent=?, flag=?,
+           highlights=?, potential_neighborhoods=?, culture_info=? WHERE id=?""",
+        body.get("motto"), body.get("desc"), body.get("videoUrl"),
+        body.get("accent"), body.get("flag"),
+        json.dumps(body.get("highlights", [])),
+        json.dumps(body.get("potentialNeighborhoods", [])),
+        culture_json, country_id,
+    )
+
+    updated = await d1_first(db, "SELECT * FROM countries WHERE id = ?", country_id)
+    plots = await d1_all(db, "SELECT * FROM plots WHERE country_id = ?", country_id)
+    return serialize_country(updated, [serialize_plot(p) for p in plots])
+
+
+@app.post("/api/admin/countries/{country_id}/visibility")
+async def toggle_country_visibility(
+    country_id: str,
+    request: Request,
+    x_user_role: str = Header(...),
+):
+    if x_user_role != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    db = get_db(request)
+    row = await d1_first(db, "SELECT is_visible FROM countries WHERE id = ?", country_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Country not found")
+
+    new_val = 0 if row["is_visible"] else 1
+    await d1_run(db, "UPDATE countries SET is_visible = ? WHERE id = ?", new_val, country_id)
+    return {"status": "success", "isVisible": bool(new_val)}
+
+
+# ─── Plots ────────────────────────────────────────────────────────────────────
+
+@app.post("/api/plots")
+async def create_plot(
+    request: Request,
+    x_user_username: str = Header(...),
+    x_user_role: str = Header(...),
+):
+    if x_user_role not in ["admin", "owner"]:
+        raise HTTPException(status_code=403, detail="Insufficient permissions")
+
+    db = get_db(request)
+    body = await request.json()
+    country_name_raw = body.get("country_id", "").strip()
+    if not country_name_raw:
+        raise HTTPException(status_code=400, detail="Country name cannot be empty")
+
+    country_slug = country_name_raw.lower().replace(" ", "-")
+    country = await d1_first(db, "SELECT id FROM countries WHERE id = ?", country_slug)
+
+    if not country:
+        flag = AFRICAN_FLAGS.get(country_slug, "🌍")
+        culture = json.dumps({
+            "whyLive": f"Live here to participate in {country_name_raw}'s rising market.",
             "bestBuild": "Modern Eco-Villas or architectural designs matching the local topography.",
             "culture": "Warm hospitality, rich regional traditions, and community values.",
-            "culturePhotos": []
+            "culturePhotos": [],
         })
+        await d1_run(
+            db,
+            """INSERT INTO countries (id, name, flag, motto, accent, desc, video_url, highlights, potential_neighborhoods, culture_info, is_visible)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)""",
+            country_slug, country_name_raw, flag,
+            "A Vibrant New Region", "#1A3E26",
+            f"Welcome to {country_name_raw}. Explore vetted, high-value investment plots across premium zones in this growing region.",
+            "https://www.w3schools.com/html/mov_bbb.mp4",
+            json.dumps(["Secure Ownership", "Vetted Surveyor Beacons", "Gated Access"]),
+            json.dumps([]), culture,
+        )
+        notif_id = f"notif-country-{country_slug}-{now_ts()}"
+        await d1_run(
+            db,
+            "INSERT INTO notifications (id, message, read, timestamp) VALUES (?, ?, 0, ?)",
+            notif_id,
+            f"Landowner added listings in '{country_name_raw}'. Landing page needs customization.",
+            now_iso(),
+        )
+
+    plot_id = f"plot-{now_ts()}"
+    await d1_run(
+        db,
+        "INSERT INTO plots (id, title, size, price, neighborhood, owner_username, country_id, photos, is_visible) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)",
+        plot_id, body.get("title"), body.get("size"), body.get("price"),
+        body.get("neighborhood"), x_user_username, country_slug,
+        json.dumps(body.get("photos", [])),
     )
-    db.add(new_country)
-    db.commit()
-    db.refresh(new_country)
-    return serialize_country(new_country)
 
-# 12. Get Pending Approvals (Admin Only)
-@app.get("/api/admin/pending-users", response_model=List[schemas.UserResponse])
-def get_pending_users(
-    x_user_role: str = Header(..., description="Logged in role"),
-    db: Session = Depends(get_db)
-):
-    if x_user_role != "admin":
-        raise HTTPException(status_code=403, detail="Admin access required")
-    pending = db.query(models.User).filter(models.User.is_approved == False).all()
-    return [
-        {
-            "username": u.username,
-            "role": u.role,
-            "label": u.username,
-            "is_approved": u.is_approved
-        }
-        for u in pending
-    ]
+    row = await d1_first(db, "SELECT * FROM plots WHERE id = ?", plot_id)
+    return serialize_plot(row)
 
-# 13. Approve User Registration (Admin Only)
-@app.post("/api/admin/approve-user/{username}")
-def approve_user(
-    username: str,
-    x_user_role: str = Header(..., description="Logged in role"),
-    db: Session = Depends(get_db)
-):
-    if x_user_role != "admin":
-        raise HTTPException(status_code=403, detail="Admin access required")
-    user = db.query(models.User).filter(models.User.username == username).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-    user.is_approved = True
-    db.commit()
-    return {"status": "success", "message": f"User {username} has been approved."}
 
-# 14. Get System Notifications (Admin Only)
-@app.get("/api/admin/notifications", response_model=List[schemas.NotificationResponse])
-def get_notifications(
-    x_user_role: str = Header(..., description="Logged in role"),
-    db: Session = Depends(get_db)
-):
-    if x_user_role != "admin":
-        raise HTTPException(status_code=403, detail="Admin access required")
-    notifs = db.query(models.Notification).order_by(models.Notification.timestamp.desc()).all()
-    return notifs
-
-# 15. Mark Notification as Read (Admin Only)
-@app.post("/api/admin/notifications/{notif_id}/read")
-def mark_notification_read(
-    notif_id: str,
-    x_user_role: str = Header(..., description="Logged in role"),
-    db: Session = Depends(get_db)
-):
-    if x_user_role != "admin":
-        raise HTTPException(status_code=403, detail="Admin access required")
-    notif = db.query(models.Notification).filter(models.Notification.id == notif_id).first()
-    if not notif:
-        raise HTTPException(status_code=404, detail="Notification not found")
-    notif.read = True
-    db.commit()
-    return {"status": "success"}
-
-# 16. Get All Users (Admin Only)
-@app.get("/api/admin/users", response_model=List[schemas.UserResponse])
-def get_all_users(
-    x_user_role: str = Header(..., description="Logged in role"),
-    x_user_username: str = Header(..., description="Logged in username"),
-    db: Session = Depends(get_db)
-):
-    if x_user_role != "admin":
-        raise HTTPException(status_code=403, detail="Admin access required")
-    users = db.query(models.User).filter(models.User.username != x_user_username).all()
-    return [
-        {
-            "username": u.username,
-            "role": u.role,
-            "label": u.username,
-            "is_approved": u.is_approved,
-            "is_suspended": u.is_suspended
-        }
-        for u in users
-    ]
-
-# 17. Toggle Suspend User Account (Admin Only)
-@app.post("/api/admin/users/{username}/suspend")
-def toggle_suspend_user(
-    username: str,
-    x_user_role: str = Header(..., description="Logged in role"),
-    db: Session = Depends(get_db)
-):
-    if x_user_role != "admin":
-        raise HTTPException(status_code=403, detail="Admin access required")
-    user = db.query(models.User).filter(models.User.username == username).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-    user.is_suspended = not user.is_suspended
-    db.commit()
-    return {"status": "success", "is_suspended": user.is_suspended, "message": f"User {username} suspension status toggled."}
-
-# 18. Delete User Account (Admin Only)
-@app.delete("/api/admin/users/{username}")
-def delete_user(
-    username: str,
-    x_user_role: str = Header(..., description="Logged in role"),
-    db: Session = Depends(get_db)
-):
-    if x_user_role != "admin":
-        raise HTTPException(status_code=403, detail="Admin access required")
-    user = db.query(models.User).filter(models.User.username == username).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-    
-    # Also delete their plots to cascade properly since database constraints require it
-    db.query(models.Plot).filter(models.Plot.owner_username == username).delete()
-    db.delete(user)
-    db.commit()
-    return {"status": "success", "message": f"User {username} and their listings have been deleted."}
-
-# 19. Toggle Country Visibility (Admin Only)
-@app.post("/api/admin/countries/{country_id}/visibility")
-def toggle_country_visibility(
-    country_id: str,
-    x_user_role: str = Header(..., description="Logged in role"),
-    db: Session = Depends(get_db)
-):
-    if x_user_role != "admin":
-        raise HTTPException(status_code=403, detail="Admin access required")
-    country = db.query(models.Country).filter(models.Country.id == country_id).first()
-    if not country:
-        raise HTTPException(status_code=404, detail="Country not found")
-    country.is_visible = not country.is_visible
-    db.commit()
-    return {"status": "success", "isVisible": country.is_visible}
-
-# 20. Toggle Plot Visibility (Admin Only)
-@app.post("/api/admin/plots/{plot_id}/visibility")
-def toggle_plot_visibility(
+@app.put("/api/plots/{plot_id}")
+async def update_plot(
     plot_id: str,
-    x_user_role: str = Header(..., description="Logged in role"),
-    db: Session = Depends(get_db)
+    request: Request,
+    x_user_username: str = Header(...),
+    x_user_role: str = Header(...),
 ):
-    if x_user_role != "admin":
-        raise HTTPException(status_code=403, detail="Admin access required")
-    plot = db.query(models.Plot).filter(models.Plot.id == plot_id).first()
+    db = get_db(request)
+    plot = await d1_first(db, "SELECT * FROM plots WHERE id = ?", plot_id)
     if not plot:
         raise HTTPException(status_code=404, detail="Plot not found")
-    plot.is_visible = not plot.is_visible
-    db.commit()
-    return {"status": "success", "isVisible": plot.is_visible}
+    if x_user_role != "admin" and plot["owner_username"] != x_user_username:
+        raise HTTPException(status_code=403, detail="You do not own this listing")
+
+    body = await request.json()
+    await d1_run(
+        db,
+        "UPDATE plots SET title=?, size=?, price=?, neighborhood=?, photos=? WHERE id=?",
+        body.get("title"), body.get("size"), body.get("price"),
+        body.get("neighborhood"), json.dumps(body.get("photos", [])), plot_id,
+    )
+
+    row = await d1_first(db, "SELECT * FROM plots WHERE id = ?", plot_id)
+    return serialize_plot(row)
+
+
+@app.delete("/api/plots/{plot_id}")
+async def delete_plot(
+    plot_id: str,
+    request: Request,
+    x_user_username: str = Header(...),
+    x_user_role: str = Header(...),
+):
+    db = get_db(request)
+    plot = await d1_first(db, "SELECT * FROM plots WHERE id = ?", plot_id)
+    if not plot:
+        raise HTTPException(status_code=404, detail="Plot not found")
+    if x_user_role != "admin" and plot["owner_username"] != x_user_username:
+        raise HTTPException(status_code=403, detail="You do not own this listing")
+
+    await d1_run(db, "DELETE FROM plot_views WHERE plot_id = ?", plot_id)
+    await d1_run(db, "DELETE FROM inquiries WHERE plot_id = ?", plot_id)
+    await d1_run(db, "DELETE FROM plots WHERE id = ?", plot_id)
+    return {"status": "success", "message": f"Plot {plot_id} successfully deleted."}
+
+
+@app.post("/api/plots/{plot_id}/view")
+async def track_view(plot_id: str, request: Request):
+    db = get_db(request)
+    plot = await d1_first(db, "SELECT id FROM plots WHERE id = ?", plot_id)
+    if not plot:
+        raise HTTPException(status_code=404, detail="Plot not found")
+    await d1_run(db, "INSERT INTO plot_views (plot_id, timestamp) VALUES (?, ?)", plot_id, now_iso())
+    return {"status": "success"}
+
+
+@app.post("/api/admin/plots/{plot_id}/visibility")
+async def toggle_plot_visibility(
+    plot_id: str,
+    request: Request,
+    x_user_role: str = Header(...),
+):
+    if x_user_role != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    db = get_db(request)
+    row = await d1_first(db, "SELECT is_visible FROM plots WHERE id = ?", plot_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Plot not found")
+
+    new_val = 0 if row["is_visible"] else 1
+    await d1_run(db, "UPDATE plots SET is_visible = ? WHERE id = ?", new_val, plot_id)
+    return {"status": "success", "isVisible": bool(new_val)}
+
+
+# ─── Inquiries ────────────────────────────────────────────────────────────────
+
+@app.post("/api/inquiries")
+async def create_inquiry(request: Request):
+    db = get_db(request)
+    body = await request.json()
+    plot_id = body.get("plot_id")
+    plot = await d1_first(db, "SELECT id FROM plots WHERE id = ?", plot_id)
+    if not plot:
+        raise HTTPException(status_code=404, detail="Plot not found")
+
+    inq_id = f"inq-{now_ts()}"
+    ts = now_iso()
+    await d1_run(
+        db,
+        """INSERT INTO inquiries (id, plot_id, full_name, email, phone, current_city, message, type, timestamp)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        inq_id, plot_id,
+        body.get("fullName"), body.get("email"), body.get("phone"),
+        body.get("currentCity"), body.get("message"), body.get("type"), ts,
+    )
+
+    row = await d1_first(
+        db,
+        """SELECT i.*, p.title as plot_title, c.name as country_name
+           FROM inquiries i
+           JOIN plots p ON i.plot_id = p.id
+           JOIN countries c ON p.country_id = c.id
+           WHERE i.id = ?""",
+        inq_id,
+    )
+    return serialize_inquiry(row)
+
+
+@app.get("/api/inquiries")
+async def get_inquiries(
+    request: Request,
+    x_user_username: str = Header(...),
+    x_user_role: str = Header(...),
+):
+    db = get_db(request)
+    if x_user_role == "admin":
+        rows = await d1_all(
+            db,
+            """SELECT i.*, p.title as plot_title, c.name as country_name
+               FROM inquiries i
+               JOIN plots p ON i.plot_id = p.id
+               JOIN countries c ON p.country_id = c.id
+               ORDER BY i.timestamp DESC""",
+        )
+    else:
+        rows = await d1_all(
+            db,
+            """SELECT i.*, p.title as plot_title, c.name as country_name
+               FROM inquiries i
+               JOIN plots p ON i.plot_id = p.id
+               JOIN countries c ON p.country_id = c.id
+               WHERE p.owner_username = ?
+               ORDER BY i.timestamp DESC""",
+            x_user_username,
+        )
+    return [serialize_inquiry(r) for r in rows]
+
+
+# ─── Dashboard Stats ──────────────────────────────────────────────────────────
+
+@app.get("/api/stats/dashboard")
+async def get_dashboard_stats(
+    request: Request,
+    x_user_username: str = Header(...),
+    x_user_role: str = Header(...),
+):
+    db = get_db(request)
+
+    if x_user_role == "admin":
+        plots = await d1_all(db, "SELECT id FROM plots")
+    else:
+        plots = await d1_all(db, "SELECT id FROM plots WHERE owner_username = ?", x_user_username)
+
+    plot_ids = [p["id"] for p in plots]
+
+    if not plot_ids:
+        return {
+            "totalViews": 0, "totalInquiries": 0, "conversionRate": "0.0",
+            "leads": [], "viewsChart": [],
+        }
+
+    placeholders = ",".join(["?" for _ in plot_ids])
+
+    views_count_row = await d1_first(
+        db, f"SELECT COUNT(*) as cnt FROM plot_views WHERE plot_id IN ({placeholders})", *plot_ids
+    )
+    views_count = views_count_row["cnt"] if views_count_row else 0
+
+    inq_count_row = await d1_first(
+        db, f"SELECT COUNT(*) as cnt FROM inquiries WHERE plot_id IN ({placeholders})", *plot_ids
+    )
+    inq_count = inq_count_row["cnt"] if inq_count_row else 0
+
+    rate = f"{((inq_count / views_count) * 100):.1f}" if views_count > 0 else "0.0"
+
+    leads_rows = await d1_all(
+        db,
+        f"""SELECT i.*, p.title as plot_title, c.name as country_name
+            FROM inquiries i
+            JOIN plots p ON i.plot_id = p.id
+            JOIN countries c ON p.country_id = c.id
+            WHERE i.plot_id IN ({placeholders})
+            ORDER BY i.timestamp DESC""",
+        *plot_ids,
+    )
+    leads = [serialize_inquiry(r) for r in leads_rows]
+
+    today = datetime.date.today()
+    views_chart = []
+    for i in range(6, -1, -1):
+        day = today - datetime.timedelta(days=i)
+        day_start = day.strftime("%Y-%m-%dT00:00:00")
+        day_end = day.strftime("%Y-%m-%dT23:59:59")
+        cnt_row = await d1_first(
+            db,
+            f"""SELECT COUNT(*) as cnt FROM plot_views
+                WHERE plot_id IN ({placeholders})
+                AND timestamp >= ? AND timestamp <= ?""",
+            *plot_ids, day_start, day_end,
+        )
+        views_chart.append({
+            "day": day.strftime("%a"),
+            "count": cnt_row["cnt"] if cnt_row else 0,
+            "active": day == today,
+        })
+
+    return {
+        "totalViews": views_count,
+        "totalInquiries": inq_count,
+        "conversionRate": rate,
+        "leads": leads,
+        "viewsChart": views_chart,
+    }
+
+
+# ─── Admin ────────────────────────────────────────────────────────────────────
+
+@app.get("/api/admin/pending-users")
+async def get_pending_users(request: Request, x_user_role: str = Header(...)):
+    if x_user_role != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+    db = get_db(request)
+    rows = await d1_all(db, "SELECT * FROM users WHERE is_approved = 0")
+    return [{"username": r["username"], "role": r["role"], "label": r["username"], "is_approved": False} for r in rows]
+
+
+@app.post("/api/admin/approve-user/{username}")
+async def approve_user(username: str, request: Request, x_user_role: str = Header(...)):
+    if x_user_role != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+    db = get_db(request)
+    row = await d1_first(db, "SELECT id FROM users WHERE username = ?", username)
+    if not row:
+        raise HTTPException(status_code=404, detail="User not found")
+    await d1_run(db, "UPDATE users SET is_approved = 1 WHERE username = ?", username)
+    return {"status": "success", "message": f"User {username} has been approved."}
+
+
+@app.get("/api/admin/users")
+async def get_all_users(
+    request: Request,
+    x_user_role: str = Header(...),
+    x_user_username: str = Header(...),
+):
+    if x_user_role != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+    db = get_db(request)
+    rows = await d1_all(db, "SELECT * FROM users WHERE username != ?", x_user_username)
+    return [
+        {"username": r["username"], "role": r["role"], "label": r["username"],
+         "is_approved": bool(r["is_approved"]), "is_suspended": bool(r["is_suspended"])}
+        for r in rows
+    ]
+
+
+@app.post("/api/admin/users/{username}/suspend")
+async def toggle_suspend_user(username: str, request: Request, x_user_role: str = Header(...)):
+    if x_user_role != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+    db = get_db(request)
+    row = await d1_first(db, "SELECT is_suspended FROM users WHERE username = ?", username)
+    if not row:
+        raise HTTPException(status_code=404, detail="User not found")
+    new_val = 0 if row["is_suspended"] else 1
+    await d1_run(db, "UPDATE users SET is_suspended = ? WHERE username = ?", new_val, username)
+    return {"status": "success", "is_suspended": bool(new_val), "message": f"User {username} suspension toggled."}
+
+
+@app.delete("/api/admin/users/{username}")
+async def delete_user(username: str, request: Request, x_user_role: str = Header(...)):
+    if x_user_role != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+    db = get_db(request)
+    row = await d1_first(db, "SELECT id FROM users WHERE username = ?", username)
+    if not row:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # Get all plots by this user to cascade delete views/inquiries
+    user_plots = await d1_all(db, "SELECT id FROM plots WHERE owner_username = ?", username)
+    for p in user_plots:
+        await d1_run(db, "DELETE FROM plot_views WHERE plot_id = ?", p["id"])
+        await d1_run(db, "DELETE FROM inquiries WHERE plot_id = ?", p["id"])
+    await d1_run(db, "DELETE FROM plots WHERE owner_username = ?", username)
+    await d1_run(db, "DELETE FROM users WHERE username = ?", username)
+    return {"status": "success", "message": f"User {username} and their listings have been deleted."}
+
+
+@app.get("/api/admin/notifications")
+async def get_notifications(request: Request, x_user_role: str = Header(...)):
+    if x_user_role != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+    db = get_db(request)
+    rows = await d1_all(db, "SELECT * FROM notifications ORDER BY timestamp DESC")
+    return [{"id": r["id"], "message": r["message"], "read": bool(r["read"]), "timestamp": r["timestamp"]} for r in rows]
+
+
+@app.post("/api/admin/notifications/{notif_id}/read")
+async def mark_notification_read(notif_id: str, request: Request, x_user_role: str = Header(...)):
+    if x_user_role != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+    db = get_db(request)
+    row = await d1_first(db, "SELECT id FROM notifications WHERE id = ?", notif_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Notification not found")
+    await d1_run(db, "UPDATE notifications SET read = 1 WHERE id = ?", notif_id)
+    return {"status": "success"}
