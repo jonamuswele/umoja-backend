@@ -1,0 +1,13 @@
+{
+  "name": "umoja-backend",
+  "main": "src/entry.py",
+  "compatibility_date": "2026-05-01",
+  "compatibility_flags": ["python_workers"],
+  "d1_databases":[
+    {
+      "binding": "DB",
+      "database_name": "umoja",
+      "database_id": "359a70c8-29f7-4cfa-9d71-a970eb8669ea"
+    }
+  ]
+}
