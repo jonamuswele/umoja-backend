@@ -1,4 +1,6 @@
-[project]
+[
+project
+]
 name = "umoja-backend"
 version = "0.1.0"
 requires-python = ">=3.12"
@@ -8,6 +10,7 @@ dependencies = [
     "workers-py>=1.9.0",
     "workers-runtime-sdk",
 ]
-
-[tool.uv]
+[
+tool.uv
+]
 package = false
