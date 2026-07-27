@@ -1,85 +1,146 @@
-from sqlalchemy import Column, Integer, String, Float, Text, DateTime, ForeignKey, Boolean
-from sqlalchemy.orm import relationship
-import datetime
-from app.database import Base
+from dataclasses import dataclass, field
+from typing import List, Optional
 
-class User(Base):
-    __tablename__ = "users"
 
-    id = Column(Integer, primary_key=True, index=True)
-    username = Column(String, unique=True, index=True, nullable=False)
-    password_hash = Column(String, nullable=False)
-    role = Column(String, nullable=False)  # "admin" or "owner"
-    is_approved = Column(Boolean, default=False)
-    is_suspended = Column(Boolean, default=False)
+@dataclass
+class User:
+    id: Optional[int]
+    username: str
+    password_hash: str
+    role: str
+    is_approved: bool
+    is_suspended: bool
 
-    plots = relationship("Plot", back_populates="owner")
+    @staticmethod
+    def from_row(row: dict) -> "User":
+        return User(
+            id=row.get("id"),
+            username=row["username"],
+            password_hash=row["password_hash"],
+            role=row["role"],
+            is_approved=bool(row["is_approved"]),
+            is_suspended=bool(row["is_suspended"]),
+        )
 
-class Country(Base):
-    __tablename__ = "countries"
 
-    id = Column(String, primary_key=True, index=True)  # e.g., "kenya"
-    name = Column(String, nullable=False)
-    flag = Column(String, default="🌍")
-    motto = Column(String)
-    accent = Column(String)
-    desc = Column(Text)
-    video_url = Column(String)
-    
-    # Store lists and complex objects as JSON strings
-    highlights = Column(Text)  # JSON List of strings
-    potential_neighborhoods = Column(Text)  # JSON List of dicts
-    culture_info = Column(Text)  # JSON dict
-    is_visible = Column(Boolean, default=True)
+@dataclass
+class Country:
+    id: str
+    name: str
+    flag: str
+    motto: Optional[str]
+    accent: Optional[str]
+    desc: Optional[str]
+    video_url: Optional[str]
+    highlights: Optional[str]           # JSON string
+    potential_neighborhoods: Optional[str]  # JSON string
+    culture_info: Optional[str]         # JSON string
+    is_visible: bool
+    plots: List = field(default_factory=list)
 
-    plots = relationship("Plot", back_populates="country", cascade="all, delete-orphan")
+    @staticmethod
+    def from_row(row: dict) -> "Country":
+        return Country(
+            id=row["id"],
+            name=row["name"],
+            flag=row.get("flag", "🌍"),
+            motto=row.get("motto"),
+            accent=row.get("accent"),
+            desc=row.get("desc"),
+            video_url=row.get("video_url"),
+            highlights=row.get("highlights"),
+            potential_neighborhoods=row.get("potential_neighborhoods"),
+            culture_info=row.get("culture_info"),
+            is_visible=bool(row.get("is_visible", 1)),
+        )
 
-class Notification(Base):
-    __tablename__ = "notifications"
 
-    id = Column(String, primary_key=True, index=True)
-    message = Column(String, nullable=False)
-    read = Column(Boolean, default=False)
-    timestamp = Column(DateTime, default=datetime.datetime.utcnow)
+@dataclass
+class Plot:
+    id: str
+    title: str
+    size: Optional[str]
+    price: float
+    neighborhood: Optional[str]
+    owner_username: str
+    country_id: str
+    photos: Optional[str]   # JSON string
+    is_visible: bool
+    country: Optional[Country] = None
 
-class Plot(Base):
-    __tablename__ = "plots"
+    @staticmethod
+    def from_row(row: dict) -> "Plot":
+        return Plot(
+            id=row["id"],
+            title=row["title"],
+            size=row.get("size"),
+            price=row["price"],
+            neighborhood=row.get("neighborhood"),
+            owner_username=row["owner_username"],
+            country_id=row["country_id"],
+            photos=row.get("photos"),
+            is_visible=bool(row.get("is_visible", 1)),
+        )
 
-    id = Column(String, primary_key=True, index=True)  # e.g., "ke-nanyuki"
-    title = Column(String, nullable=False)
-    size = Column(String)
-    price = Column(Float, nullable=False)
-    neighborhood = Column(Text)
-    owner_username = Column(String, ForeignKey("users.username"), nullable=False)
-    country_id = Column(String, ForeignKey("countries.id"), nullable=False)
-    photos = Column(Text)  # JSON List of dicts
-    is_visible = Column(Boolean, default=True)
 
-    owner = relationship("User", back_populates="plots")
-    country = relationship("Country", back_populates="plots")
-    views = relationship("PlotView", back_populates="plot", cascade="all, delete-orphan")
-    inquiries = relationship("Inquiry", back_populates="plot", cascade="all, delete-orphan")
+@dataclass
+class PlotView:
+    id: Optional[int]
+    plot_id: str
+    timestamp: str
 
-class PlotView(Base):
-    __tablename__ = "plot_views"
+    @staticmethod
+    def from_row(row: dict) -> "PlotView":
+        return PlotView(
+            id=row.get("id"),
+            plot_id=row["plot_id"],
+            timestamp=row["timestamp"],
+        )
 
-    id = Column(Integer, primary_key=True, index=True)
-    plot_id = Column(String, ForeignKey("plots.id"), nullable=False)
-    timestamp = Column(DateTime, default=datetime.datetime.utcnow)
 
-    plot = relationship("Plot", back_populates="views")
+@dataclass
+class Inquiry:
+    id: str
+    plot_id: str
+    full_name: str
+    email: str
+    phone: Optional[str]
+    current_city: Optional[str]
+    message: Optional[str]
+    type: str
+    timestamp: str
+    plot_title: Optional[str] = None
+    country_name: Optional[str] = None
 
-class Inquiry(Base):
-    __tablename__ = "inquiries"
+    @staticmethod
+    def from_row(row: dict) -> "Inquiry":
+        return Inquiry(
+            id=row["id"],
+            plot_id=row["plot_id"],
+            full_name=row["full_name"],
+            email=row["email"],
+            phone=row.get("phone"),
+            current_city=row.get("current_city"),
+            message=row.get("message"),
+            type=row["type"],
+            timestamp=row["timestamp"],
+            plot_title=row.get("plot_title"),
+            country_name=row.get("country_name"),
+        )
 
-    id = Column(String, primary_key=True, index=True)  # e.g., "inq-123456"
-    plot_id = Column(String, ForeignKey("plots.id"), nullable=False)
-    full_name = Column(String, nullable=False)
-    email = Column(String, nullable=False)
-    phone = Column(String)
-    current_city = Column(String)
-    message = Column(Text)
-    type = Column(String, nullable=False)  # "Buy" or "Negotiate"
-    timestamp = Column(DateTime, default=datetime.datetime.utcnow)
 
-    plot = relationship("Plot", back_populates="inquiries")
+@dataclass
+class Notification:
+    id: str
+    message: str
+    read: bool
+    timestamp: str
+
+    @staticmethod
+    def from_row(row: dict) -> "Notification":
+        return Notification(
+            id=row["id"],
+            message=row["message"],
+            read=bool(row.get("read", 0)),
+            timestamp=row["timestamp"],
+        )
