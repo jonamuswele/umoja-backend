@@ -6,6 +6,7 @@ dependencies = [
     "fastapi",
     "pydantic",
     "workers-py>=1.9.0",
+    "workers-runtime-sdk",
 ]
 
 [tool.uv]
