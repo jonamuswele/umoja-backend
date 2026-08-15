@@ -1,0 +1,6 @@
+node_modules/
+.wrangler/
+umoja_terra_data.json
+umoja_terra.db
+package-lock.json
+.env

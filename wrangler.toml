@@ -1,0 +1,9 @@
+name = "umoja-backend-hono"
+main = "src/index.js"
+compatibility_date = "2024-04-01"
+
+# Cloudflare D1 Database binding
+[[d1_databases]]
+binding = "DB"
+database_name = "umoja"
+database_id = "359a70c8-29f7-4cfa-9d71-a970eb8669ea"
